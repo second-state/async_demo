@@ -68,6 +68,31 @@ impl Loader {
             })
         }
     }
+
+    pub fn load_async_module_from_bytes(
+        &self,
+        wasm: &[u8],
+        async_fn_names: &[&str],
+    ) -> Result<AstModule, WasmEdgeError> {
+        let mut module = binaryen::Module::read(wasm).map_err(|_| WasmEdgeError::ModuleCreate)?;
+        let mut codegen_config = binaryen::CodegenConfig::default();
+        codegen_config.optimization_level = 3;
+        unsafe {
+            let async_fn_name = async_fn_names.join(",");
+            module
+                .run_optimization_passes(
+                    ["asyncify"],
+                    &[("asyncify-imports", &async_fn_name)],
+                    &codegen_config,
+                )
+                .map_err(|_| WasmEdgeError::ModuleCreate)?;
+
+            binaryen::ffi::BinaryenClearPassArguments();
+        }
+        // fix
+        let new_wasm = module.write();
+        self.load_module_from_bytes(&new_wasm)
+    }
 }
 
 pub(crate) struct InnerValidator(pub(crate) *mut ffi::WasmEdge_ValidatorContext);

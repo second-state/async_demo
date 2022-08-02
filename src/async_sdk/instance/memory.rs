@@ -2,7 +2,7 @@ use super::super::utils::check;
 use std::ops::RangeInclusive;
 use wasmedge_sys::ffi;
 use wasmedge_types::error::{MemError, WasmEdgeError};
-use wasmedge_types::WasmEdgeResult;
+use wasmedge_types::{MemoryType, WasmEdgeResult};
 
 /// Defines a WebAssembly memory instance, which is a linear memory described by its [type](crate::MemType). Each memory instance consists of a vector of bytes and an optional maximum size, and its size is a multiple of the WebAssembly page size (*64KiB* of each page).
 #[derive(Debug)]
@@ -28,7 +28,7 @@ impl Memory {
         }
     }
 
-    pub fn get_mem_type_limit(&self) -> WasmEdgeResult<RangeInclusive<u32>> {
+    pub fn get_type(&self) -> WasmEdgeResult<(u32, Option<u32>, bool)> {
         let ty_ctx = unsafe { ffi::WasmEdge_MemoryInstanceGetMemoryType(self.inner.0) };
         if ty_ctx.is_null() {
             Err(WasmEdgeError::Mem(MemError::Type))
@@ -147,8 +147,16 @@ pub struct MemType {
     pub(crate) inner: InnerMemType,
 }
 impl MemType {
-    pub fn create(limit: RangeInclusive<u32>) -> WasmEdgeResult<Self> {
-        let ctx = unsafe { ffi::WasmEdge_MemoryTypeCreate(ffi::WasmEdge_Limit::from(limit)) };
+    pub fn create(min: u32, max: Option<u32>, shared: bool) -> WasmEdgeResult<Self> {
+        let ty = MemoryType::new(min, max, shared)?;
+        let ctx = unsafe {
+            ffi::WasmEdge_MemoryTypeCreate(ffi::WasmEdge_Limit {
+                HasMax: ty.maximum().is_some(),
+                Shared: ty.shared(),
+                Min: ty.minimum(),
+                Max: ty.maximum().unwrap_or(ty.minimum()),
+            })
+        };
         match ctx.is_null() {
             true => Err(WasmEdgeError::MemTypeCreate),
             false => Ok(Self {
@@ -157,9 +165,13 @@ impl MemType {
         }
     }
 
-    pub fn limit(&self) -> RangeInclusive<u32> {
+    pub fn limit(&self) -> (u32, Option<u32>, bool) {
         let limit = unsafe { ffi::WasmEdge_MemoryTypeGetLimit(self.inner.0) };
-        RangeInclusive::from(limit)
+        (
+            limit.Min,
+            if limit.HasMax { Some(limit.Max) } else { None },
+            limit.Shared,
+        )
     }
 
     pub(crate) fn delete(self) {
@@ -169,19 +181,18 @@ impl MemType {
     }
 }
 
-impl From<wasmedge_types::MemoryType> for MemType {
-    fn from(ty: wasmedge_types::MemoryType) -> Self {
-        MemType::create(ty.minimum()..=ty.maximum()).expect(
-            "[wasmedge] Failed to convert wasmedge_types::MemoryType into wasmedge_sys::MemType.",
-        )
-    }
-}
+// impl From<wasmedge_types::MemoryType> for WasmEdgeResult<MemType> {
+//     fn from(ty: wasmedge_types::MemoryType) -> Self {
+//         MemType::create(ty.minimum(), ty.maximum(), ty.shared()).expect(
+//             "[wasmedge] Failed to convert wasmedge_types::MemoryType into wasmedge_sys::MemType.",
+//         )
+//     }
+// }
+
 impl From<MemType> for wasmedge_types::MemoryType {
     fn from(ty: MemType) -> Self {
-        wasmedge_types::MemoryType::new(
-            ty.limit().start().to_owned(),
-            Some(ty.limit().end().to_owned()),
-        )
+        let limit = ty.limit();
+        wasmedge_types::MemoryType::new(limit.0, limit.1, limit.2).unwrap()
     }
 }
 

@@ -10,6 +10,7 @@
   (func $main
     (call $print (i32.const 1))
     (call $sleep)
+    (call $print (i32.const 2))
     (call $print (i32.const 3))
   )
   (export "_start" (func $main))

@@ -1,5 +1,3 @@
-use std::future::Future;
-
 use self::{config::Config, executor::Executor, types::WasmVal};
 
 pub mod ast_module;
@@ -78,12 +76,12 @@ impl Linker {
     }
 }
 
-pub struct ImportModuleBuilder {
+pub struct ImportModuleBuilder<'a> {
     import_obj: ImportModule,
-    linker_ctx: *mut Linker,
+    linker_ctx: &'a mut Linker,
 }
 
-impl ImportModuleBuilder {
+impl ImportModuleBuilder<'_> {
     pub fn add_func(
         &mut self,
         name: &str,
@@ -114,10 +112,17 @@ impl AsLinker for Box<Linker> {
     ) -> Result<(), WasmEdgeError> {
         let mut builder = ImportModuleBuilder {
             import_obj: ImportModule::create(name)?,
-            linker_ctx: self.as_mut() as *mut Linker,
+            linker_ctx: self.as_mut(),
         };
         f(&mut builder)?;
-        self.executor.register_import_object(builder.import_obj)?;
+
+        let ImportModuleBuilder {
+            import_obj,
+            linker_ctx,
+        } = builder;
+
+        linker_ctx.executor.register_import_object(import_obj)?;
+
         Ok(())
     }
 
@@ -149,10 +154,10 @@ pub mod async_mod {
         AsLinker, AstModule, ImportModule, Linker,
     };
 
-    pub type ResultFuture = Pin<Box<dyn Future<Output = WasmEdgeResult<Vec<WasmVal>>>>>;
+    pub type ResultFuture = Box<dyn Future<Output = WasmEdgeResult<Vec<WasmVal>>>>;
 
     pub struct WasmEdgeResultFuture<'a> {
-        linker: &'a mut AsyncLink,
+        linker: &'a mut AsyncLinker,
         name: String,
         args: Vec<WasmVal>,
     }
@@ -194,13 +199,13 @@ pub mod async_mod {
         returns: *mut ffi::WasmEdge_Value,
         return_len: u32,
     ) -> ffi::WasmEdge_Result {
-        let data = unsafe { (data as *mut AsyncLink).as_mut() };
+        let data = unsafe { (data as *mut AsyncLinker).as_mut() };
         if let Some(data) = data {
             let cx = data.cx.clone();
             let mut cx = Context::from_waker(&cx);
 
             let mut fut = if data.asyncify_done() {
-                let real_fn: fn(&mut AsyncLink, &[WasmVal]) -> ResultFuture =
+                let real_fn: fn(&mut AsyncLinker, Vec<WasmVal>) -> ResultFuture =
                     unsafe { std::mem::transmute(key_ptr) };
 
                 let input = {
@@ -212,7 +217,7 @@ pub mod async_mod {
                         .collect::<Vec<WasmVal>>()
                 };
 
-                real_fn(data, &input)
+                Pin::from(real_fn(data, input))
             } else {
                 data.func_futures.pop_back().unwrap()
             };
@@ -231,7 +236,7 @@ pub mod async_mod {
                         }
                         ffi::WasmEdge_Result { Code: 0 }
                     }
-                    Err(c) => ffi::WasmEdge_Result { Code: 64 },
+                    Err(_) => ffi::WasmEdge_Result { Code: 64 },
                 },
                 std::task::Poll::Pending => {
                     data.asyncify_interrupt();
@@ -245,22 +250,24 @@ pub mod async_mod {
     }
 
     pub trait AsAsyncLinker {
-        fn new_import_object<F: FnMut(&mut AsyncImportModuleBuilder) -> Result<(), WasmEdgeError>>(
+        fn new_import_object<
+            F: FnOnce(&mut AsyncImportModuleBuilder) -> Result<(), WasmEdgeError>,
+        >(
             &mut self,
             name: &str,
-            f: &mut F,
+            f: F,
         ) -> Result<(), WasmEdgeError>;
 
         fn active_module(&mut self, ast_module: &AstModule) -> Result<(), WasmEdgeError>;
     }
 
-    impl AsAsyncLinker for Box<AsyncLink> {
+    impl AsAsyncLinker for Box<AsyncLinker> {
         fn new_import_object<
-            F: FnMut(&mut AsyncImportModuleBuilder) -> Result<(), WasmEdgeError>,
+            F: FnOnce(&mut AsyncImportModuleBuilder) -> Result<(), WasmEdgeError>,
         >(
             &mut self,
             name: &str,
-            f: &mut F,
+            f: F,
         ) -> Result<(), WasmEdgeError> {
             let mut builder = AsyncImportModuleBuilder {
                 import_obj: ImportModule::create(name)?,
@@ -283,15 +290,15 @@ pub mod async_mod {
         }
     }
 
-    pub struct AsyncLink {
+    pub struct AsyncLinker {
         cx: Waker,
         real_linker: Box<Linker>,
-        func_futures: std::collections::LinkedList<ResultFuture>,
+        func_futures: std::collections::LinkedList<Pin<ResultFuture>>,
     }
 
-    impl AsyncLink {
+    impl AsyncLinker {
         pub fn new(config: &Option<Config>) -> WasmEdgeResult<Box<Self>> {
-            Ok(Box::new(AsyncLink {
+            Ok(Box::new(AsyncLinker {
                 cx: waker_fn::waker_fn(|| {}),
                 real_linker: Linker::new(config)?,
                 func_futures: Default::default(),
@@ -337,7 +344,7 @@ pub mod async_mod {
 
     pub struct AsyncImportModuleBuilder<'a> {
         import_obj: ImportModule,
-        linker_ctx: &'a mut AsyncLink,
+        linker_ctx: &'a mut AsyncLinker,
     }
 
     impl AsyncImportModuleBuilder<'_> {
@@ -345,7 +352,7 @@ pub mod async_mod {
             &mut self,
             name: &str,
             ty: (Vec<ValType>, Vec<ValType>),
-            real_fn: fn(linker: &'static mut AsyncLink, args: &[WasmVal]) -> ResultFuture,
+            real_fn: fn(linker: &'static mut AsyncLinker, args: Vec<WasmVal>) -> ResultFuture,
             cost: u64,
         ) -> WasmEdgeResult<()> {
             self.import_obj
@@ -357,9 +364,9 @@ pub mod async_mod {
         pub fn add_async_func(
             &mut self,
             name: &str,
-            data: &mut AsyncLink,
+            data: &mut AsyncLinker,
             ty: (Vec<ValType>, Vec<ValType>),
-            real_fn: fn(&'static mut AsyncLink, &[WasmVal]) -> ResultFuture,
+            real_fn: fn(&'static mut AsyncLinker, Vec<WasmVal>) -> ResultFuture,
             cost: u64,
         ) -> WasmEdgeResult<()> {
             let func_name = WasmEdgeString::new(name);
@@ -378,7 +385,7 @@ pub mod async_mod {
     impl Function {
         pub(crate) fn create_async<T: Sized>(
             ty: (Vec<ValType>, Vec<ValType>),
-            real_fn: fn(&'static mut AsyncLink, &[WasmVal]) -> ResultFuture,
+            real_fn: fn(&'static mut AsyncLinker, Vec<WasmVal>) -> ResultFuture,
             data: *mut T,
             cost: u64,
         ) -> WasmEdgeResult<Self> {
@@ -403,8 +410,8 @@ pub mod async_mod {
         }
     }
 
-    fn linker_sleep(linker: &'static mut AsyncLink, args: &[WasmVal]) -> ResultFuture {
-        Box::pin(async {
+    fn linker_sleep(linker: &'static mut AsyncLinker, args: Vec<WasmVal>) -> ResultFuture {
+        Box::new(async {
             println!(" sleep... {}", chrono::Utc::now());
             linker.call("call_sleep1", vec![]).await?;
             let timeout = Duration::from_secs(2);
@@ -414,8 +421,8 @@ pub mod async_mod {
         })
     }
 
-    fn linker_sleep1(linker: &'static mut AsyncLink, args: &[WasmVal]) -> ResultFuture {
-        Box::pin(async {
+    fn linker_sleep1(linker: &'static mut AsyncLinker, args: Vec<WasmVal>) -> ResultFuture {
+        Box::new(async {
             println!("  sleep1... {}", chrono::Utc::now());
             let timeout = Duration::from_secs(2);
             tokio::time::sleep(timeout).await;
@@ -424,10 +431,8 @@ pub mod async_mod {
         })
     }
 
-    fn linker_prn(linker: &'static mut AsyncLink, args: &[WasmVal]) -> ResultFuture {
-        let args = args.to_vec();
-
-        Box::pin(async move {
+    fn linker_prn(linker: &'static mut AsyncLinker, args: Vec<WasmVal>) -> ResultFuture {
+        Box::new(async move {
             println!("=> print {:?}", args);
             Ok(vec![])
         })
@@ -435,28 +440,29 @@ pub mod async_mod {
 
     pub fn try_(config: &Option<Config>, ast_module: AstModule) {
         println!("start try");
-        let mut vm = AsyncLink::new(&config).unwrap();
+        let mut linker = AsyncLinker::new(&config).unwrap();
 
-        vm.new_import_object("spectest", &mut |builder| {
-            builder.add_func("sleep", (vec![], vec![]), linker_sleep, 0)?;
-            builder.add_func("sleep1", (vec![], vec![]), linker_sleep1, 0)?;
-            builder.add_func("print", (vec![ValType::I32], vec![]), linker_prn, 0)?;
-            Ok(())
-        })
-        .unwrap();
+        linker
+            .new_import_object("spectest", |builder| {
+                builder.add_func("sleep", (vec![], vec![]), linker_sleep, 0)?;
+                builder.add_func("sleep1", (vec![], vec![]), linker_sleep1, 0)?;
+                builder.add_func("print", (vec![ValType::I32], vec![]), linker_prn, 0)?;
+                Ok(())
+            })
+            .unwrap();
 
-        vm.active_module(&ast_module).unwrap();
+        linker.active_module(&ast_module).unwrap();
 
         println!("init_module ok");
         println!();
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
 
         runtime.block_on(async move {
-            vm.call("_start", vec![]).await.unwrap();
+            linker.call("_start", vec![]).await.unwrap();
         })
     }
 }
