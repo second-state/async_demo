@@ -74,22 +74,35 @@ impl Loader {
         wasm: &[u8],
         async_fn_names: &[&str],
     ) -> Result<AstModule, WasmEdgeError> {
-        let mut module = binaryen::Module::read(wasm).map_err(|_| WasmEdgeError::ModuleCreate)?;
         let mut codegen_config = binaryen::CodegenConfig::default();
-        codegen_config.optimization_level = 3;
-        unsafe {
-            let async_fn_name = async_fn_names.join(",");
-            module
-                .run_optimization_passes(
-                    ["asyncify"],
-                    &[("asyncify-imports", &async_fn_name)],
-                    &codegen_config,
-                )
-                .map_err(|_| WasmEdgeError::ModuleCreate)?;
+        codegen_config.optimization_level = 2;
+        // codegen_config.debug_info = true;
 
-            binaryen::ffi::BinaryenClearPassArguments();
+        let async_fn_name = async_fn_names.join(",");
+        codegen_config
+            .pass_argument
+            .push(("asyncify-imports".to_string(), async_fn_name));
+
+        let mut module = binaryen::Module::read(wasm).map_err(|_| WasmEdgeError::ModuleCreate)?;
+
+        // pass start
+        {
+            if let Some(start) = module.get_start() {
+                let global_ref = module.add_global("run_start", true, 0_i32).unwrap();
+                let new_body = module.binaryen_if(
+                    module.binaryen_get_global(global_ref),
+                    start.body(),
+                    module.binaryen_set_global(global_ref, module.binaryen_const_value(1_i32)),
+                );
+                start.set_body(new_body);
+                module.add_function_export(&start, "async_start").unwrap();
+            }
         }
-        // fix
+
+        module
+            .run_optimization_passes(["asyncify", "strip"], &codegen_config)
+            .map_err(|_| WasmEdgeError::ModuleCreate)?;
+
         let new_wasm = module.write();
         self.load_module_from_bytes(&new_wasm)
     }

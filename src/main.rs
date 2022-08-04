@@ -10,12 +10,13 @@ fn pass_and_load_wasm(path: &str) -> Vec<u8> {
     let mut codegen_config = binaryen::CodegenConfig::default();
     codegen_config.shrink_level = 2;
     codegen_config.optimization_level = 3;
+    codegen_config.pass_argument.push((
+        "asyncify-imports".to_string(),
+        "spectest.sleep*".to_string(),
+    ));
+
     module
-        .run_optimization_passes(
-            ["asyncify"],
-            &[("asyncify-imports", "spectest.sleep*")],
-            &codegen_config,
-        )
+        .run_optimization_passes(["asyncify"], &codegen_config)
         .unwrap();
     module.write()
 }
@@ -139,16 +140,24 @@ fn try_asyncify() {
 
 fn main() {
     println!("Hello, world!");
-    let wasm = pass_and_load_wasm("demo2.wasm");
-    std::fs::write("demo_async.wasm", &wasm).unwrap();
+
     let mut config = Config::create().unwrap();
     config.bulk_memory_operations(true);
     config.multi_memories(true);
+    config.wasi(true);
     let config = Some(config);
 
     let loader = Loader::create(&config).unwrap();
-    // let ast_module = loader.load_async_module_from_bytes(&wasm,&[]).unwrap();
-    let ast_module = loader.load_module_from_bytes(&wasm).unwrap();
+
+    // let wasm = std::fs::read("demo2.wasm").unwrap();
+
+    let wasm = std::fs::read("wasm_main.wasm").unwrap();
+
+    let ast_module = loader
+        .load_async_module_from_bytes(&wasm, &["spectest.sleep*"])
+        .unwrap();
+
+    // let ast_module = loader.load_module_from_bytes(&wasm).unwrap();
 
     async_sdk::async_mod::try_(&config, ast_module);
 }
